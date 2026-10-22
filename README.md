@@ -167,3 +167,7 @@ FPS=30000/1001 FIRST_STEP_TOLERANCE=2 tests/run.sh
 VFR=1 FPS=3001/100 FIRST_STEP_TOLERANCE=2 tests/run.sh   # uneven frame timing
 LUA_CONFIG='previous_frame={key="w"}' PREV_KEY_CODE=119 tests/run.sh
 ```
+
+## License
+
+[MIT](LICENSE)
