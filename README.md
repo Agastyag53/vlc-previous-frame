@@ -31,6 +31,9 @@ Linux. VLC 4 changed the scripting interface and isn't supported.
    1. Open **Tools › Preferences** (macOS: **VLC › Settings**).
    2. Bottom left, under **Show settings**, select **All**.
    3. Go to **Interface › Main interfaces** and tick **Lua interpreter**.
+      Don't tick **Command-line interface**; that one opens a console
+      window. The **Extra interface modules** field should now contain
+      `luaintf`.
    4. Expand **Main interfaces**, select **Lua**, and type `previous_frame`
       in **Lua interface**.
    5. Click **Save**, then quit and restart VLC.
@@ -119,6 +122,11 @@ You can see what it does in **Tools › Messages** with verbosity set to
 
 ## Troubleshooting
 
+- **A black console window opens with VLC** ("Command Line Interface
+  initialized"). That's VLC's command-line interface, not this add-on. In
+  **Interface › Main interfaces**, untick **Command-line interface** and make
+  sure **Extra interface modules** reads `luaintf` (remove `cli`, `luacli`,
+  `luarc` or `rc` if present). Save and restart VLC.
 - **Nothing happens when I press Q.** Check that **Lua interpreter** is ticked
   and that **Lua interface** says exactly `previous_frame`, then restart VLC.
   In **Tools › Messages** (verbosity 2), look for
