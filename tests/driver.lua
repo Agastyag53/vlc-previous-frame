@@ -10,6 +10,8 @@
 local KEY_SPACE, KEY_E = 32, 101
 -- Code of the key previous_frame.lua is configured with (default: q)
 local KEY_Q = tonumber(os.getenv("PREV_KEY_CODE") or "113")
+-- With uneven frame timing only Q after E is exact; Q after Q is measured
+local CHAIN = os.getenv("VFR") and "?-1" or -1
 
 local function sleep(ms) vlc.misc.mwait(vlc.misc.mdate() + ms * 1000) end
 local function log(...)
@@ -53,13 +55,13 @@ for i = 1, 8 do
     press(KEY_Q)
     s = snap("back", s, "~-1")
     press(KEY_Q)
-    s = snap("back", s, -1)
+    s = snap("back-after-Q", s, CHAIN)
     press(KEY_E)
     s = snap("E-after-Q", s, 1)
     press(KEY_E)
     s = snap("E", s, 1)
     press(KEY_Q)
-    s = snap("back", s, -1)
+    s = snap("back-after-E", s, -1)
     press(KEY_SPACE)
 end
 
@@ -72,13 +74,21 @@ s = snap("E-x3", s, 3)
 press(KEY_Q)
 s = snap("back", s, "~-1")
 press(KEY_Q); sleep(100); press(KEY_Q); sleep(100); press(KEY_Q)
-s = snap("back-x3", s, -3)
+s = snap("back-x3", s, os.getenv("VFR") and "?-3" or -3)
 
 -- Key repeat
 for i = 1, 6 do press(KEY_Q); sleep(40) end
-s = snap("back-x6-fast", s, -6)
+s = snap("back-x6-fast", s, os.getenv("VFR") and "?-6" or -6)
 for i = 1, 4 do press(KEY_E); sleep(40) end
 s = snap("E-x4-fast", s, 4)
+for i = 1, 3 do press(KEY_E); sleep(150) end
+s = snap("E-x3", s, 3)
+press(KEY_Q)
+s = snap("back-after-E", s, -1)
+press(KEY_Q)
+s = snap("back-after-E", s, -1)
+press(KEY_Q)
+s = snap("back-after-E", s, -1)
 
 -- Short replay after stepping (VLC refreshes "time" late after a seek)
 press(KEY_SPACE)
@@ -94,7 +104,7 @@ sleep(1000)
 press(KEY_Q)
 s = snap("Q-while-playing")
 press(KEY_Q)
-s = snap("back", s, -1)
+s = snap("back-after-Q", s, CHAIN)
 
 -- Moving while paused (seek bar click, dragging, jump hotkeys), then Q.
 -- VLC doesn't report the new position precisely, so the first step is only
@@ -114,7 +124,9 @@ for _, move in ipairs(moves) do
     press(KEY_Q)
     s = snap("back", s, "?-1")
     press(KEY_Q)
-    s = snap("back", s, -1)
+    s = snap("back-after-Q", s, CHAIN)
+    press(KEY_E)
+    s = snap("E-after-Q", s, 1)
 end
 
 -- Stepping back stops at the very first frame

@@ -21,25 +21,31 @@
  ------------
  VLC 3 offers no backwards decoding, so stepping back means seeking. A seek
  while paused shows the first frame whose timestamp is at or after the
- target, so seeking to the middle of the gap before frame N shows exactly
- frame N. The hard part is knowing which frame is on screen: the "time"
- variable VLC exposes to scripts is only refreshed every 250 ms while
- playing, is not touched by frame stepping, and is skewed after a seek
- while paused. So this script keeps track of the frame number itself:
+ target. Scripts can't see which frame is on screen: the "time" variable is
+ only refreshed every 250 ms while playing, is not touched by frame
+ stepping, and is skewed after a seek while paused. So this script keeps
+ track of the position itself, as "last seek target + N frame steps":
 
-   * when playback gets paused, it extrapolates from the last refresh of
-     "time" to the moment of the pause;
-   * after each of its own seeks it knows the exact frame on screen;
-   * it counts "Next frame" key presses so E and Q can be mixed freely;
-   * it notices seeks made while paused (the input statistics change) and
-     falls back to VLC's "time" variable in that case.
+   * Q after N >= 1 steps seeks back to the same target and replays N - 1
+     steps with VLC's own "Next frame", which lands exactly on the previous
+     frame even when frames aren't evenly spaced (variable frame rate);
+   * Q right after a seek (N = 0) seeks one frame duration further back,
+     exact for constant frame rate video;
+   * after a seek while paused VLC usually swallows the next "Next frame"
+     (it shows the same frame again; always after two seeks in a row), so
+     the script makes sure of that and sends one itself, keeping E a single
+     press;
+   * when playback gets paused, the position is extrapolated from the last
+     refresh of "time"; seeks made while paused by other means (seek bar,
+     jump hotkeys) are noticed because the input statistics change.
 --]]
 
 local DEFAULT_KEY = "q"
 
 local POLL_US = 10000         -- how often keys and player state are checked
 local SETTLE_US = 500000      -- how long our own actions may disturb the stats
-local AFTER_NEXT_US = 50000   -- let VLC handle its "Next frame" before seeking
+local ACTION_GAP_US = 50000   -- between our seeks and steps (VLC needs a moment)
+local MAX_REPLAY = 10         -- most steps replayed for one Q
 local FALLBACK_FPS = 25
 
 local PLAYING_S, PAUSE_S = 2, 3
@@ -152,12 +158,18 @@ local function detect_fps(item)
     return fallback
 end
 
--- Per-media state
+-- Per-media state. While paused, the frame on screen is described either
+-- as `anchor` (target of our last seek) + `steps`, or, before our first
+-- seek, as `base` (estimated time of the paused frame, or "time" to read
+-- VLC's "time" variable after an outside seek) + `steps`.
 local uri            -- current media, to notice when it changes
 local frame_us       -- duration of one frame
-local frame          -- index of the frame on screen while paused, if known
-local seeked         -- whether our last action was a seek
-local seek_due       -- when to seek to `frame` (see step_forward)
+local anchor, base, steps
+local swallow        -- VLC will ignore the next "Next frame": "ours" when we
+                     -- have queued one to use it up, "outside" otherwise
+local seeked         -- whether anything seeked since playback was paused
+local queue          -- our pending seeks and steps, run ACTION_GAP_US apart
+local next_action_at
 local stats_sig      -- input stats while paused, to notice outside seeks
 local settle_until   -- our own actions may still change the stats until then
 local time_seen      -- last value of the "time" variable while playing
@@ -167,10 +179,14 @@ local resumed_at     -- when that happened
 
 local last_state, last_poll
 
+local function forget_position()
+    anchor, base, steps, swallow, queue, seeked = nil, nil, 0, nil, {}, false
+end
+
 local function reset()
-    uri, frame_us, frame, seeked, seek_due = nil, nil, nil, false, nil
-    stats_sig, settle_until = nil, 0
+    uri, frame_us, stats_sig, settle_until, next_action_at = nil, nil, nil, 0, 0
     time_seen, time_seen_at, resumed_from, resumed_at = nil, nil, nil, nil
+    forget_position()
 end
 
 local function frame_duration(item)
@@ -190,14 +206,30 @@ end
 local function estimate_time(input, at)
     local t = vlc.var.get(input, "time")
     local rate = vlc.var.get(input, "rate")
-    if time_seen_at and t == time_seen then
+    if t ~= time_seen then
+        return t
+    end
+    if time_seen_at then
         return t + (at - time_seen_at) * rate
     end
-    -- After a seek VLC only refreshes "time" once it has buffered again
+    -- "time" hasn't changed since playback resumed: after a seek VLC only
+    -- refreshes it once it has buffered again
     if resumed_from then
         return resumed_from + (at - resumed_at) * rate
     end
     return t
+end
+
+-- Approximate timestamp of the frame on screen while paused
+local function current_time(input, d)
+    if anchor then return anchor + (steps + 0.5) * d end
+    if base == "time" then
+        -- An outside seek: "time" holds its target, and VLC shows the first
+        -- frame at or after it
+        local t = vlc.var.get(input, "time")
+        return (math.ceil(t / d) + 0.25 + steps) * d
+    end
+    if base then return base + steps * d end
 end
 
 local function signature(input, item)
@@ -207,47 +239,70 @@ local function signature(input, item)
                           tostring(s.decoded_video) }, "|")
 end
 
-local function show_frame(input, item, n, now)
-    frame = math.max(0, n)
-    -- Middle of the gap before the wanted frame: VLC shows the first frame
-    -- at or after the target, and small timestamp offsets don't matter.
-    local target = math.max(0, math.floor((frame - 0.5) * frame_duration(item)))
-    log("show frame %d (seek to %d us)", frame, target)
-    vlc.var.set(input, "time", target)
-    seeked, seek_due = true, nil
-    settle_until = now + SETTLE_US
+local function show_message(text)
+    local ok, translated = pcall(function() return vlc.gettext._(text) end)
+    vlc.osd.message(ok and translated or text)
+end
+
+-- Seek to `target`, use up the step VLC then swallows, and take `replay`
+-- more steps
+local function seek_and_step(target, replay)
+    -- One seek isn't always enough: when playback was paused and E pressed,
+    -- VLC's next step after the first seek isn't swallowed. After a second
+    -- seek it always is.
+    queue = { { seek = target } }
+    if not seeked then queue[#queue + 1] = { seek = target } end
+    queue[#queue + 1] = { step = true }
+    for _ = 1, replay do queue[#queue + 1] = { step = true } end
+    anchor, steps, seeked = target, replay, true
+    log("seek to %d us, then %d step(s)", target, replay)
 end
 
 local function step_back(input, item, state, now)
+    local d = frame_duration(item)
     if state == PLAYING_S then
         vlc.var.set(input, "state", PAUSE_S)
-        frame = math.floor(estimate_time(input, now) / frame_duration(item))
+        forget_position()
+        base = estimate_time(input, now)
     elseif state ~= PAUSE_S then
         return state
-    elseif not frame then
-        local t = vlc.var.get(input, "time")
-        frame = math.floor(t / frame_duration(item) + 0.5)
-        log("position unknown, using time %d us", t)
     end
-    if frame > 0 then
-        show_frame(input, item, frame - 1, now)
+    show_message("Previous frame")
+
+    if anchor and steps >= 1 and steps <= MAX_REPLAY then
+        seek_and_step(anchor, steps - 1)
+    elseif anchor and steps == 0 then
+        if anchor > 0 then
+            seek_and_step(math.max(0, math.floor(anchor - d)), 0)
+        end
+    else
+        -- Middle of the gap before the wanted frame: VLC shows the first
+        -- frame at or after the target, so small offsets don't matter.
+        local t = current_time(input, d) or vlc.var.get(input, "time")
+        local wanted = math.floor(t / d) - 1
+        if wanted >= 0 then
+            seek_and_step(math.max(0, math.floor((wanted - 0.5) * d)), 0)
+        end
     end
     return PAUSE_S
 end
 
-local function step_forward(input, item, now)
-    if seeked then
-        -- VLC ignores the first "Next frame" after a seek while paused (it
-        -- shows the same frame again), so do the step ourselves. Not right
-        -- away though: a seek that closely follows "Next frame" can leave
-        -- the video output stuck.
-        frame = frame + 1
-        seek_due = now + AFTER_NEXT_US
-        settle_until = now + SETTLE_US
-    else
-        frame = frame + 1
-        settle_until = now + SETTLE_US
+local function run_queue(input, state, now)
+    if #queue == 0 or now < next_action_at then return end
+    if state ~= PAUSE_S then
+        queue = {}
+        return
     end
+    local action = table.remove(queue, 1)
+    if action.seek then
+        vlc.var.set(input, "time", action.seek)
+        swallow = "ours"
+    else
+        vlc.var.trigger_callback(input, "frame-next")
+        if swallow == "ours" then swallow = nil end
+    end
+    next_action_at = now + ACTION_GAP_US
+    settle_until = now + SETTLE_US
 end
 
 local function poll()
@@ -279,42 +334,54 @@ local function poll()
         local t = vlc.var.get(input, "time")
         if last_state ~= PLAYING_S then
             time_seen, time_seen_at = t, nil
-            resumed_from = frame and frame * frame_duration(item)
+            resumed_from = current_time(input, frame_duration(item))
             resumed_at = now
         elseif t ~= time_seen then
             -- The change happened somewhere since the previous poll
             time_seen, time_seen_at = t, (now + last_poll) / 2
         end
-        frame, seeked, seek_due, stats_sig = nil, false, nil, nil
+        forget_position()
+        stats_sig = nil
     elseif state == PAUSE_S and last_state == PLAYING_S then
-        local paused_at = (now + last_poll) / 2
-        local t = estimate_time(input, paused_at)
-        frame = math.floor(t / frame_duration(item))
+        forget_position()
+        base = estimate_time(input, (now + last_poll) / 2)
         settle_until = now + SETTLE_US
-        log("paused on frame %d (estimated %d us)", frame, t)
+        log("paused at about %d us", base)
     end
 
-    if next_keys[key] and frame and last_state == PAUSE_S then
-        step_forward(input, item, now)
+    if next_keys[key] and last_state == PAUSE_S and (anchor or base) then
+        if swallow == "outside" then
+            swallow = nil       -- VLC ignored this one
+        else
+            -- If our own step is still queued, VLC ignored this one and
+            -- ours will do the step instead
+            steps = steps + 1
+            swallow = nil
+        end
+        settle_until = now + SETTLE_US
     end
 
     if prev_keys[key] then
         state = step_back(input, item, state, now)
     end
 
-    if seek_due and now >= seek_due then
-        show_frame(input, item, frame, now)
-    end
+    run_queue(input, state, now)
 
-    -- A seek made while paused (seek bar, arrow keys...) changes the input
+    -- A seek made while paused (seek bar, jump hotkeys...) changes the input
     -- statistics. Ours do too, so only look once they have settled.
-    if state == PAUSE_S and frame then
+    if state == PAUSE_S then
         local sig = signature(input, item)
         if now < settle_until or not stats_sig then
             stats_sig = sig
         elseif sig ~= stats_sig then
             log("position changed outside of this script")
-            frame, seeked, seek_due, stats_sig = nil, false, nil, nil
+            -- VLC swallows the next step after this seek, except for the
+            -- first one after pausing playback and pressing E
+            local live = base and not seeked and steps > 0
+            forget_position()
+            base, seeked = "time", true
+            swallow = not live and "outside" or nil
+            stats_sig = sig
         end
     end
 
@@ -322,6 +389,7 @@ local function poll()
 end
 
 local function run()
+    reset()
     last_poll = vlc.misc.mdate()
     while true do
         local ok, err = pcall(poll)

@@ -56,6 +56,9 @@ vlc --extraintf=luaintf --lua-intf=previous_frame video.mp4
 | `E` | Next frame (built into VLC) |
 | `Q` | Previous frame (this add-on) |
 
+Like `E`, `Q` shows a short "Previous frame" message in the top right corner
+of the video.
+
 Keyboard focus has to be on the VLC window (or the video), as with VLC's own
 hotkeys.
 
@@ -90,35 +93,44 @@ previous_frame={key="q", fps=23.976}
 
 ## How accurate is it?
 
-Every step is exactly one frame, with one exception: **the first `Q` right
-after you pause playback** (or `Q` pressed while playing) can land one frame
-off, occasionally two at high frame rates. After that, each press of `Q` or
-`E` moves exactly one frame.
+- **`E`** always moves exactly one frame. It's VLC's own step; the add-on
+  only makes sure it isn't swallowed after a `Q`.
+- **`Q` after one or more `E` presses** is always exact.
+- **`Q` after `Q`** is exact on constant-frame-rate video (films, most camera
+  and TV files). On variable-frame-rate video, typically phone and screen
+  recordings with an odd frame rate such as 30.01 or 8.67 fps, it sometimes
+  stays on the same frame or skips one, because the frames aren't evenly
+  spaced.
+- **The first `Q` right after you pause playback** (or `Q` pressed while
+  playing) can land one frame off, occasionally two at high frame rates.
+- **The first `Q` after you move the position while paused** (seek bar or
+  jump hotkeys) can land a few frames off if you had been stepping with `E`
+  before.
 
-This happens because VLC 3 doesn't let scripts see exactly which frame is on
-screen when you pause. The time it reports can be off by a few tens of
-milliseconds, so the script has to estimate. Once the script has made its own
-first step, it knows the exact frame and keeps track from there.
+Whenever a press lands off, the next presses move from where you actually
+are, so just press again.
 
-Moving the position while paused (clicking or dragging the seek bar, or using
-the jump hotkeys) is detected, and the next `Q` steps back from the new
-position.
+Why: VLC 3 doesn't let scripts see which frame is on screen. The time it
+reports to scripts is only refreshed every 250 ms during playback, doesn't
+follow frame stepping, and is unreliable after a seek. So the add-on keeps
+track of the position itself, which is exact from its own seeks onwards and
+an estimate before that.
 
 ## How it works
 
-VLC 3 can't decode backwards, so the script steps back by seeking. A seek
-while paused shows the first frame at or after the target time, so the script
-seeks to just before the frame it wants. It runs as a small Lua "interface"
-in the background and checks every 10 ms which key was pressed last. The
-check is cheap: about 1% of one CPU core.
+VLC 3 can't decode backwards, so the add-on steps back by seeking. A seek
+while paused shows the first frame at or after the target time.
 
-Two VLC quirks are worked around:
+- After `Q`, it remembers its seek target. If you then press `E` a few times
+  and `Q` again, it seeks back to that target and replays one step fewer with
+  VLC's own "Next frame". That's exact even when frames are unevenly spaced.
+- `Q` right after a seek seeks one frame duration further back.
+- After a seek while paused, VLC ignores the next "Next frame" and shows the
+  same frame again. The add-on uses up that step itself, so your next `E`
+  always moves.
 
-- After a seek while paused, VLC ignores the next **Next frame** and shows the
-  same frame again. When you press `E` right after a `Q`, the script makes
-  that step itself.
-- The playback time VLC reports to scripts doesn't follow frame stepping and
-  is unreliable right after a seek. The script counts frames itself instead.
+It runs as a small Lua "interface" in the background and checks every 10 ms
+which key was pressed last. That costs about 1% of one CPU core.
 
 You can see what it does in **Tools › Messages** with verbosity set to
 **2 (debug)**. Its lines start with `[previous_frame]`.
@@ -152,5 +164,6 @@ press against the expected one.
 ```sh
 tests/run.sh           # 25 fps
 FPS=30000/1001 FIRST_STEP_TOLERANCE=2 tests/run.sh
+VFR=1 FPS=3001/100 FIRST_STEP_TOLERANCE=2 tests/run.sh   # uneven frame timing
 LUA_CONFIG='previous_frame={key="w"}' PREV_KEY_CODE=119 tests/run.sh
 ```
