@@ -35,8 +35,8 @@ Linux. VLC 4 changed the scripting interface and isn't supported.
 
       Don't use the **Lua interpreter** checkbox: it writes `lua` into the
       field, which makes VLC open its command-line console instead of
-      loading this add-on. With `luaintf` typed in, that checkbox shows as
-      unticked, which is fine.
+      loading this add-on. Once `luaintf` is typed in, it doesn't matter
+      whether that checkbox looks ticked or not.
    4. Expand **Main interfaces**, select **Lua**, and type `previous_frame`
       in **Lua interface**.
    5. Click **Save**, then quit and restart VLC.
